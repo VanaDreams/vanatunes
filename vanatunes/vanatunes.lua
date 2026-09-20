@@ -4,7 +4,7 @@
     Drop mp3 or wav files in a folder and the window lists them. Shuffle on, and it plays
     from the list wherever you are, moving to another song when one ends. The songs are
     played by Windows itself, beside the game: no game track is forced or replaced, and the
-    zone's own music carries on underneath unless you turn it down in the game's sound config.
+    game's own Music Volume is turned down while one plays and put back when it stops.
 
     Nothing plays until you are in game, so the title screen keeps its own music.
 
@@ -21,7 +21,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.2.0';
+addon.version = '0.3.0';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -35,11 +35,13 @@ local ffi      = require('ffi');
 -- ---------------------------------------------------------------------------
 local defaults = T{
     window_open = T{ true },
-    folder      = T{ '' },       -- empty = config\vanatunes\music under the Ashita folder
+    folder      = T{ '' },       -- empty = "Vanadreams Music" on the Desktop
     shuffle     = T{ true },
-    autoplay    = T{ true },     -- start playing once you are in game
+    autoplay    = T{ false },    -- start playing once you are in game; off until the player asks
     volume      = T{ 60 },       -- 0-100
     skipped     = T{},           -- file names unticked in the list
+    game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
+    game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
 };
 
 local cfg = settings.load(defaults);
@@ -63,6 +65,55 @@ local function mci(command)
         return nil, ffi.string(mci_err);
     end
     return ffi.string(mci_buf);
+end
+
+-- ---------------------------------------------------------------------------
+-- The real Desktop folder, wherever Windows keeps it (OneDrive moves it on many PCs).
+-- ---------------------------------------------------------------------------
+ffi.cdef[[
+    typedef struct { uint32_t d1; uint16_t d2; uint16_t d3; uint8_t d4[8]; } vt_guid_t;
+    int32_t SHGetKnownFolderPath(const vt_guid_t* id, uint32_t flags, void* token, wchar_t** path);
+    void    CoTaskMemFree(void* p);
+    int     WideCharToMultiByte(uint32_t codepage, uint32_t flags, const wchar_t* wide, int wide_len, char* out, int out_len, const char* def, int* used_def);
+]];
+
+local function desktop_dir()
+    local ok, dir = pcall(function ()
+        local shell32, ole32 = ffi.load('shell32'), ffi.load('ole32');
+        -- FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+        local id = ffi.new('vt_guid_t', { 0xB4BFCC3A, 0xDB2C, 0x424C, { 0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41 } });
+        local wide = ffi.new('wchar_t*[1]');
+        if shell32.SHGetKnownFolderPath(id, 0, nil, wide) ~= 0 then return nil; end
+        local out = ffi.new('char[1024]');
+        local n = ffi.C.WideCharToMultiByte(0, 0, wide[0], -1, out, 1024, nil, nil);   -- the ANSI code page, which is what MCI takes
+        ole32.CoTaskMemFree(wide[0]);
+        if n <= 1 then return nil; end
+        return ffi.string(out);
+    end);
+    return ok and dir or nil;
+end
+
+-- ---------------------------------------------------------------------------
+-- The game's own Music Volume (Main Menu > Config > Sound), setting 10 of the client's
+-- configuration, read and written the way Ashita's bundled 'config' addon by atom0s does it:
+-- the same two functions, found by the same two signatures.
+-- ---------------------------------------------------------------------------
+ffi.cdef[[
+    typedef int32_t (__cdecl* vt_get_config_t)(int32_t);
+    typedef int32_t (__cdecl* vt_set_config_t)(int32_t, int32_t);
+]];
+local GAME_MUSIC_VOLUME = 10;
+local game = { get = nil, set = nil, ok = false };
+
+local function find_game_config()
+    local ok = pcall(function ()
+        local get_ptr = ashita.memory.find(0, 0, '8B0D????????85C974??8B44240450E8????????C383C8FFC3', 0, 0);
+        local set_ptr = ashita.memory.find(0, 0, '85C974??8B4424088B5424045052E8????????C383C8FFC3', -6, 0);
+        if get_ptr == nil or get_ptr == 0 or set_ptr == nil or set_ptr == 0 then error('not found'); end
+        game.get = ffi.cast('vt_get_config_t', get_ptr);
+        game.set = ffi.cast('vt_set_config_t', set_ptr);
+    end);
+    game.ok = ok and game.get ~= nil and game.set ~= nil;
 end
 
 -- ---------------------------------------------------------------------------
@@ -94,9 +145,19 @@ local function logged_in()
     return AshitaCore:GetMemoryManager():GetPlayer():GetLoginStatus() == 2;
 end
 
+-- The player's own songs: the folder typed in the window, else "Vanadreams Music" on the Desktop,
+-- else (no Desktop to be found) config\vanatunes\music under the Ashita folder.
+local default_dir = nil;
 local function music_dir()
     local dir = cfg.folder[1];
-    if dir == nil or #dir == 0 then dir = ('%sconfig\\vanatunes\\music\\'):format(AshitaCore:GetInstallPath()); end
+    if dir == nil or #dir == 0 then
+        if default_dir == nil then
+            local desktop = desktop_dir();
+            default_dir = desktop and (desktop:gsub('[\\/]+$', '') .. '\\Vanadreams Music\\')
+                                   or ('%sconfig\\vanatunes\\music\\'):format(AshitaCore:GetInstallPath());
+        end
+        dir = default_dir;
+    end
     if dir:sub(-1) ~= '\\' and dir:sub(-1) ~= '/' then dir = dir .. '\\'; end
     return dir;
 end
@@ -150,7 +211,8 @@ local function scan()
     player.current = 0;
     for i, t in ipairs(found) do if t.path == playing_path then player.current = i; end end
     player.folder_shown[1] = dir;
-    player.note = (#found == 0) and ('No songs yet. Put mp3 or wav files in ' .. dir) or '';
+    player.note = (#found == 0) and ('No songs yet. Put mp3 or wav files in ' .. dir)
+               or (player.state == 'stopped' and 'Press My music to start the playlist.' or '');
 end
 
 local function playable(i)
@@ -248,6 +310,27 @@ local function pause()
     end
 end
 
+-- While a song of ours is sounding the game's Music Volume is turned down to cfg.game_music;
+-- the moment ours is not sounding (paused, stopped, title screen, unloaded) it goes back to what
+-- the player had. What they had is kept in the settings file, so a crash with the music turned
+-- down is put right the next time the addon loads.
+local function sync_game_music(ours_is_sounding)
+    if not game.ok then return; end
+    if ours_is_sounding then
+        local want = math.max(0, math.min(100, cfg.game_music[1]));
+        if cfg.game_music_before == -1 then
+            cfg.game_music_before = game.get(GAME_MUSIC_VOLUME);
+            settings.save();
+        end
+        want = math.min(want, cfg.game_music_before);   -- turned down, never up
+        if game.get(GAME_MUSIC_VOLUME) ~= want then game.set(GAME_MUSIC_VOLUME, want); end
+    elseif cfg.game_music_before ~= -1 then
+        game.set(GAME_MUSIC_VOLUME, cfg.game_music_before);
+        cfg.game_music_before = -1;
+        settings.save();
+    end
+end
+
 local function tick()
     while #player.pending > 0 do table.remove(player.pending, 1)(); end
 
@@ -256,6 +339,7 @@ local function tick()
     player.next_poll = t + 0.25;
 
     local in_game = logged_in();
+    sync_game_music(in_game and player.state == 'playing');
     if in_game and cfg.autoplay[1] and not player.auto_started then
         player.auto_started = true;
         if player.state == 'stopped' and #player.tracks > 0 then next_track(); end
@@ -305,6 +389,17 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
     imgui.SetNextWindowSize({ 380, 0 }, ImGuiCond_FirstUseEver);
     if imgui.Begin('Vanadreams music', cfg.window_open) then
         local now_playing = player.tracks[player.current];
+
+        -- Which music you are hearing, one press either way.
+        local ours = player.state == 'playing';
+        if imgui.RadioButton('My music', ours) and not ours then play_or_resume(); end
+        imgui.SameLine();
+        if imgui.RadioButton('Game music', not ours) and ours then pause(); end
+        if not game.ok then
+            imgui.TextDisabled("Could not reach the game's Music Volume: turn it down yourself in Config > Sound.");
+        end
+        imgui.Separator();
+
         if player.state == 'playing' then
             if imgui.Button('Pause', { 80, 26 }) then pause(); end
         else
@@ -330,6 +425,9 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         imgui.SameLine();
         changed = imgui.Checkbox('Start when I am in game', cfg.autoplay) or changed;
         if imgui.SliderInt('Volume', cfg.volume, 0, 100) then apply_volume(); changed = true; end
+        if game.ok then
+            changed = imgui.SliderInt('Game music under mine', cfg.game_music, 0, 100) or changed;
+        end
         if changed then settings.save(); end
 
         imgui.Separator();
@@ -361,11 +459,14 @@ end);
 -- ---------------------------------------------------------------------------
 ashita.events.register('load', 'vanatunes_load', function ()
     math.randomseed(os.time());
+    find_game_config();
     scan();
     say(('loaded, %d song(s). /vanatunes opens the window.'):format(#player.tracks));
 end);
 
 ashita.events.register('unload', 'vanatunes_unload', function ()
     close_device();
+    player.state = 'stopped';
+    sync_game_music(false);   -- the player's own Music Volume back before we go
     settings.save();
 end);
