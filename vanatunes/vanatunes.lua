@@ -21,7 +21,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.2';
+addon.version = '0.3.3';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -513,7 +513,7 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
     tick();
     if not cfg.window_open[1] then return; end
     imgui.SetNextWindowSize({ 380, 0 }, ImGuiCond_FirstUseEver);
-    if imgui.Begin('Vanadreams music', cfg.window_open) then
+    if imgui.Begin(('vanatunes %s###vanatunes'):format(addon.version), cfg.window_open) then
         local now_playing = player.tracks[player.current];
 
         -- Which music you are hearing, one press either way.
