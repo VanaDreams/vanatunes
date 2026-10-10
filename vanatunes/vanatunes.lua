@@ -21,7 +21,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.1';
+addon.version = '0.3.2';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -57,6 +57,10 @@ local cfg = settings.load(defaults);
 -- crash dumps at the same instruction). So, from 0.3.1: a song change is three steps on three
 -- frames (stop, then close, then open), the device is never closed from the frame that queried
 -- it, and every song gets a fresh alias so a new graph can never collide with one still closing.
+-- 0.3.1 still crashed that PC, idle, mid-session: a frame (about 16ms) after a song ends or is
+-- stopped is not long enough for the decoder to wind down. From 0.3.2 the steps are spaced in real
+-- time (a second from stop to close, half a second from close to open), and while a song plays the
+-- device is asked nothing except, in its last few seconds, whether it is over.
 -- ---------------------------------------------------------------------------
 ffi.cdef[[
     uint32_t mciSendStringA(const char* command, char* result, uint32_t result_len, void* callback);
@@ -66,6 +70,9 @@ local winmm   = ffi.load('winmm');
 local mci_buf = ffi.new('char[512]');
 local mci_err = ffi.new('char[256]');
 local alias_n = 0;
+local STOP_TO_CLOSE = 1.0;     -- seconds from a stop (or a song ending) to closing its device
+local CLOSE_TO_OPEN = 0.5;     -- seconds from closing a device to opening the next song
+ffi.cdef[[ void Sleep(uint32_t ms); ]];
 
 local function mci(command)
     local err = winmm.mciSendStringA(command, mci_buf, 512, nil);
@@ -137,15 +144,16 @@ local player = {
     alias         = nil,        -- the open MCI device's alias, nil when none is open
     state         = 'stopped',  -- 'playing' / 'paused' / 'stopped'
     length        = 0,          -- ms
-    position      = 0,          -- ms
+    played_ms     = 0,          -- ms of the song heard up to the last pause
+    since         = nil,        -- os.clock() when it last started sounding, nil while it is not
     next_poll     = 0,
     auto_started  = false,
     held_for_title = false,     -- paused because you left the game; carries on when you are back
     note          = '',
     pending       = T{},        -- work queued by commands, run on the render thread
     folder_shown  = T{ '' },
-    -- a song change in steps, one per frame, so the decoder is never torn down mid-callback
-    switch        = nil,        -- { step = 'stop'|'close'|'open', index = n } or nil
+    -- a song change in steps, well apart in time, so the decoder is never torn down while it unwinds
+    switch        = nil,        -- { step = 'stop'|'close'|'open', index = n (0: open nothing), at = os.clock() } or nil
     ended         = false,      -- the device reported the song over; picked up next frame
 };
 
@@ -264,8 +272,20 @@ end
 local function device_close()
     if player.alias then mci('close ' .. player.alias); end
     player.alias = nil;
-    player.length, player.position = 0, 0;
+    player.length = 0;
+    player.played_ms, player.since = 0, nil;
 end
+
+-- Where the song is, by our own clock: the device is not asked, so it is left alone while it plays.
+local function position_ms()
+    local ms = player.played_ms;
+    if player.since then ms = ms + (os.clock() - player.since) * 1000; end
+    if player.length > 0 then ms = math.min(ms, player.length); end
+    return ms;
+end
+
+local function clock_run()  if player.since == nil then player.since = os.clock(); end end
+local function clock_hold() player.played_ms = position_ms(); player.since = nil; end
 
 -- Opens a song on a brand-new alias. Only ever called with no device open (device_close first).
 local function device_open(i)
@@ -285,24 +305,37 @@ local function device_open(i)
     player.length = tonumber(mci(('status %s length'):format(alias))) or 0;
     mci(('setaudio %s volume to %d'):format(alias, math.max(0, math.min(100, cfg.volume[1])) * 10));
     mci('play ' .. alias);
+    player.played_ms, player.since = 0, nil;
+    clock_run();
     player.state = 'playing';
     player.note = '';
     player.ended = false;
     return true;
 end
 
+-- Stops now; run_switch closes the device later, once the decoder has had time to wind down.
 local function stop_all(note)
-    player.switch = nil;
     player.ended = false;
-    device_stop();
-    device_close();
+    if player.alias then
+        if player.switch == nil or player.switch.step == 'stop' then
+            device_stop();
+            clock_hold();
+            player.switch = { step = 'close', index = 0, at = os.clock() + STOP_TO_CLOSE };
+        else
+            player.switch.index = 0;   -- already winding down: keep its timing, open nothing after
+        end
+    else
+        player.switch = nil;
+    end
     player.state = 'stopped';
     player.held_for_title = false;
     if note then player.note = note; end
 end
 
 local function apply_volume()
-    if player.alias then mci(('setaudio %s volume to %d'):format(player.alias, math.max(0, math.min(100, cfg.volume[1])) * 10)); end
+    if player.alias and player.state ~= 'stopped' and not player.switch then
+        mci(('setaudio %s volume to %d'):format(player.alias, math.max(0, math.min(100, cfg.volume[1])) * 10));
+    end
 end
 
 -- Which song to play next, marking and passing over any that will not open.
@@ -315,16 +348,18 @@ local function choose_playable()
     return 0;
 end
 
--- Ask for a song. It starts over the next frames: stop this frame, close the next, open the one after.
--- Nothing is torn down inside the frame that asked, which is what the decoder cannot take.
+-- Ask for a song. It starts over the next second or so: stop now, close a second later, open half
+-- a second after that. Nothing is torn down inside the frame that asked, and never straight after a stop.
 local function begin_switch(i)
     if i == 0 then
         stop_all((#player.tracks == 0) and ('No songs yet. Put mp3 or wav files in ' .. music_dir()) or 'Nothing ticked that will play.');
         return;
     end
     player.ended = false;
-    player.switch = { step = player.alias and 'stop' or 'open', index = i };
     player.note = '';
+    -- a change already under way keeps its timing and just takes the new song
+    if player.switch then player.switch.index = i; return; end
+    player.switch = { step = player.alias and 'stop' or 'open', index = i, at = os.clock() };
 end
 
 local function next_track()
@@ -335,31 +370,41 @@ local function play_index(i)
     if playable(i) or (player.tracks[i] and not player.tracks[i].bad) then begin_switch(i); else next_track(); end
 end
 
--- One step of a pending song change. Called once per frame from tick().
+-- One step of a pending song change, taken only once its time has come. Called every frame from tick().
 local function run_switch()
     local sw = player.switch;
-    if sw == nil then return; end
+    if sw == nil or os.clock() < sw.at then return; end
     if sw.step == 'stop' then
         device_stop();
-        sw.step = 'close';
+        clock_hold();
+        sw.step, sw.at = 'close', os.clock() + STOP_TO_CLOSE;
     elseif sw.step == 'close' then
         device_close();
-        sw.step = 'open';
+        sw.step, sw.at = 'open', os.clock() + CLOSE_TO_OPEN;
     else
         player.switch = nil;
+        if sw.index == 0 then return; end   -- it was a stop: nothing to open
         if not device_open(sw.index) then
             -- that one will not open: pick another, the same careful way
             local i = choose_playable();
-            if i ~= 0 then player.switch = { step = 'open', index = i };
+            if i ~= 0 then player.switch = { step = 'open', index = i, at = os.clock() };
             else stop_all('Nothing ticked that will play.'); end
         end
     end
 end
 
 local function play_or_resume()
-    if player.switch then return; end
+    if player.switch then
+        -- stopped and still winding down: play once the old device is closed
+        if player.switch.index == 0 then
+            local i = choose_playable();
+            if i ~= 0 then player.switch.index = i; player.note = ''; end
+        end
+        return;
+    end
     if player.state == 'paused' and player.alias then
         mci('resume ' .. player.alias);
+        clock_run();
         player.state = 'playing';
         player.held_for_title = false;
     elseif player.state ~= 'playing' then
@@ -370,6 +415,7 @@ end
 local function pause()
     if player.state == 'playing' and player.alias and not player.switch then
         mci('pause ' .. player.alias);
+        clock_hold();
         player.state = 'paused';
     end
 end
@@ -398,13 +444,17 @@ end
 local function tick()
     while #player.pending > 0 do table.remove(player.pending, 1)(); end
 
-    -- A song change moves one step every frame, so stop, close and open never share a frame.
+    -- A song change moves on only when its time has come, so stop, close and open are well apart.
     run_switch();
 
-    -- The song the device said was over last poll: move on now, a frame later, not inside that poll.
+    -- The song the device said was over has stopped by itself: the change starts at the close,
+    -- a second from now, not inside the poll that heard it.
     if player.ended and not player.switch then
         player.ended = false;
-        next_track();
+        local i = choose_playable();
+        clock_hold();
+        player.switch = { step = 'close', index = i, at = os.clock() + STOP_TO_CLOSE };
+        if i == 0 then player.state = 'stopped'; player.note = 'Nothing ticked that will play.'; end
     end
 
     local t = os.clock();
@@ -421,10 +471,12 @@ local function tick()
     if not in_game and player.state == 'playing' then pause(); player.held_for_title = true; end
     if in_game and player.held_for_title and player.state == 'paused' then play_or_resume(); end
 
-    -- Only ask the device questions while it is quietly playing: never while a change is under way.
+    -- The device is asked whether the song is over only in its last few seconds (or when its length
+    -- is unknown), and never while a change is under way. The rest of the song it is left alone.
     if player.alias and player.state == 'playing' and not player.switch then
-        player.position = tonumber(mci(('status %s position'):format(player.alias))) or player.position;
-        if mci(('status %s mode'):format(player.alias)) == 'stopped' then player.ended = true; end
+        if player.length <= 0 or position_ms() >= player.length - 3000 then
+            if mci(('status %s mode'):format(player.alias)) == 'stopped' then player.ended = true; end
+        end
     end
 end
 
@@ -486,8 +538,9 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
 
         if now_playing and player.state ~= 'stopped' then
             imgui.Text(now_playing.name);
-            local fraction = player.length > 0 and math.min(1, player.position / player.length) or 0;
-            imgui.ProgressBar(fraction, { -1, 14 }, ('%s / %s'):format(clock(player.position), clock(player.length)));
+            local at = position_ms();
+            local fraction = player.length > 0 and math.min(1, at / player.length) or 0;
+            imgui.ProgressBar(fraction, { -1, 14 }, ('%s / %s'):format(clock(at), clock(player.length)));
         else
             imgui.TextDisabled(player.state == 'stopped' and 'Stopped' or '');
         end
@@ -539,9 +592,13 @@ ashita.events.register('load', 'vanatunes_load', function ()
 end);
 
 ashita.events.register('unload', 'vanatunes_unload', function ()
+    -- the device has to go before we do; still, stop it first and give the decoder a moment
+    if player.alias then
+        if player.switch == nil or player.switch.step == 'stop' then device_stop(); end
+        ffi.C.Sleep(300);
+        device_close();
+    end
     player.switch = nil;
-    device_stop();
-    device_close();
     player.state = 'stopped';
     sync_game_music(false);   -- the player's own Music Volume back before we go
     settings.save();
