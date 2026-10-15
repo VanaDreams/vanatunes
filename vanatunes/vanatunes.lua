@@ -119,10 +119,11 @@ end
 -- Windows Media Player app. It decodes with Windows' own MP3 decoder and feeds the sound card
 -- from audio threads Windows runs at audio priority, so the game's busy frame loop cannot starve
 -- it. Under MCI some players heard songs break up and distort a few seconds in while the same
--- file was clean in a media player: DirectShow picks whatever MP3 decoder ranks highest on that
--- PC (codec packs put their own first) and its streaming threads run at normal priority, beside
--- the game's. It runs free-threaded (MFP_OPTION_FREE_THREADED_CALLBACK) with no callback, so it
--- needs nothing from the game's message loop.
+-- file was clean in a media player. The files and the decoder were not at fault (the stock MP3
+-- Decoder DMO on both PCs checked, no codec packs); MCI's DirectShow graph streams to its
+-- DirectSound renderer on normal-priority threads inside the game, beside its busy frame loop.
+-- It runs free-threaded (MFP_OPTION_FREE_THREADED_CALLBACK) with no callback, so it needs nothing
+-- from the game's message loop.
 --
 -- 'mci': the DirectShow device everything used up to 0.3.3, kept for PCs without Media
 -- Foundation (Windows N editions) and for any song Media Foundation will not open.
