@@ -125,8 +125,10 @@ end
 -- It runs free-threaded (MFP_OPTION_FREE_THREADED_CALLBACK) with no callback, so it needs nothing
 -- from the game's message loop.
 --
--- 'mci': the DirectShow device everything used up to 0.3.3, kept for PCs without Media
--- Foundation (Windows N editions) and for any song Media Foundation will not open.
+-- 'mci': the DirectShow device everything used up to 0.3.3, kept only for PCs without Media
+-- Foundation (Windows N editions) or when the player asks for it. Its DirectShow decoders are what
+-- crashed the game on a song change (see above), so a song Media Foundation will not open is
+-- skipped rather than tried on MCI.
 -- ---------------------------------------------------------------------------
 local function mci_open(path, vol)
     alias_n = alias_n + 1;
@@ -424,17 +426,19 @@ local function clock_hold() player.played_ms = position_ms(); player.since = nil
 
 local function volume_pct() return math.max(0, math.min(100, cfg.volume[1])); end
 
--- Opens a song, on Media Foundation unless that is off, missing or has already failed this song,
--- then on MCI. Only ever called with no device open (device_close first).
+-- Opens a song on Media Foundation, or on MCI only when Media Foundation is missing or the player
+-- asked for it (/vanatunes engine mci). A song Media Foundation will not open is skipped, never
+-- handed to MCI: files DirectShow chokes on are what crashed the game on a song change.
+-- Only ever called with no device open (device_close first).
 local function device_open(i)
     local t = player.tracks[i];
     if t == nil then return false; end
     local dev, err;
-    if cfg.engine[1] ~= 'mci' and not t.mf_bad then
+    if cfg.engine[1] ~= 'mci' and mf.ok then
         dev, err = mf_open(t.path, volume_pct());
-        if dev == nil then t.mf_bad = true; end
+    else
+        dev, err = mci_open(t.path, volume_pct());
     end
-    if dev == nil then dev, err = mci_open(t.path, volume_pct()); end
     if dev == nil then
         t.bad = true;
         say(('cannot play %s: %s'):format(t.name, err));
@@ -612,16 +616,16 @@ local function tick()
     -- The device is asked whether the song is over only in its last few seconds (or, on MCI, when its
     -- length is unknown), and never while a change is under way. The rest of the song it is left alone.
     -- Media Foundation opens in the background, so its length is picked up once it is known; a song it
-    -- never opens is tried again on MCI.
+    -- never opens is marked and skipped.
     local dev = player.dev;
     if dev and player.state == 'playing' and not player.switch then
         if dev.kind == 'mf' and player.length <= 0 then
             player.length = dev.length();
             if player.length <= 0 and dev.failed() then
                 local t = player.tracks[player.current];
-                if t then t.mf_bad = true; end
-                say(('%s would not open on Media Foundation; trying the old player.'):format(t and t.name or 'that song'));
-                begin_switch(player.current);
+                if t then t.bad = true; end
+                say(('cannot play %s: Windows could not open it; skipping it.'):format(t and t.name or 'that song'));
+                next_track();
             end
         elseif player.length <= 0 or position_ms() >= player.length - 3000 then
             if dev.over() then player.ended = true; end
@@ -645,7 +649,7 @@ ashita.events.register('command', 'vanatunes_cmd', function (e)
         local want = (args[3] or ''):lower();
         if want == 'mci' or want == 'auto' then
             cfg.engine[1] = want; settings.save();
-            for _, t in ipairs(player.tracks) do t.mf_bad = nil; end
+            for _, t in ipairs(player.tracks) do t.bad = false; end
             say(('engine %s: from the next song.'):format(want));
         else
             say(('engine %s (Media Foundation %s); playing on %s'):format(cfg.engine[1], mf.ok and 'available' or 'not available',
