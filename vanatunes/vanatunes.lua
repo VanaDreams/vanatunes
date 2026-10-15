@@ -17,11 +17,12 @@
       /vanatunes shuffle       shuffle on or off
       /vanatunes volume 0-100  how loud
       /vanatunes rescan        read the folder again
+      /vanatunes engine        which player plays the songs; 'engine mci' for the old one, 'engine auto' back
 ]]
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.3';
+addon.version = '0.4.0';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -42,6 +43,7 @@ local defaults = T{
     skipped     = T{},           -- file names unticked in the list
     game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
     game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
+    engine      = T{ 'auto' },   -- 'auto': Media Foundation, else the old MCI player; 'mci': always the old one
 };
 
 local cfg = settings.load(defaults);
@@ -110,6 +112,138 @@ local function desktop_dir()
 end
 
 -- ---------------------------------------------------------------------------
+-- The two players a song can be opened on. Both give back the same small device: stop, close,
+-- pause, resume, volume, length() in ms (0 while not known yet) and over() once it has ended.
+--
+-- 'mf' (from 0.4.0, the default): Media Foundation's simple player (mfplay), the engine behind the
+-- Windows Media Player app. It decodes with Windows' own MP3 decoder and feeds the sound card
+-- from audio threads Windows runs at audio priority, so the game's busy frame loop cannot starve
+-- it. Under MCI some players heard songs break up and distort a few seconds in while the same
+-- file was clean in a media player: DirectShow picks whatever MP3 decoder ranks highest on that
+-- PC (codec packs put their own first) and its streaming threads run at normal priority, beside
+-- the game's. It runs free-threaded (MFP_OPTION_FREE_THREADED_CALLBACK) with no callback, so it
+-- needs nothing from the game's message loop.
+--
+-- 'mci': the DirectShow device everything used up to 0.3.3, kept for PCs without Media
+-- Foundation (Windows N editions) and for any song Media Foundation will not open.
+-- ---------------------------------------------------------------------------
+local function mci_open(path, vol)
+    alias_n = alias_n + 1;
+    local alias = ('vanatunes%d'):format(alias_n);
+    local ok, err = mci(('open "%s" type mpegvideo alias %s'):format(path, alias));
+    if ok == nil then return nil, err; end
+    mci(('set %s time format milliseconds'):format(alias));
+    local length = tonumber(mci(('status %s length'):format(alias))) or 0;
+    mci(('setaudio %s volume to %d'):format(alias, vol * 10));
+    mci('play ' .. alias);
+    return {
+        kind   = 'mci',
+        stop   = function () mci('stop ' .. alias); end,
+        close  = function () mci('close ' .. alias); end,
+        pause  = function () mci('pause ' .. alias); end,
+        resume = function () mci('resume ' .. alias); end,
+        volume = function (v) mci(('setaudio %s volume to %d'):format(alias, v * 10)); end,
+        length = function () return length; end,
+        over   = function () return mci(('status %s mode'):format(alias)) == 'stopped'; end,
+        failed = function () return false; end,
+    };
+end
+
+ffi.cdef[[
+    typedef struct { uint16_t vt; uint16_t r1, r2, r3; int64_t hVal; } vt_propvariant_t;
+    typedef struct { void** vtbl; } vt_mfp_t;
+    int32_t __stdcall MFStartup(uint32_t version, uint32_t flags);
+    int32_t __stdcall MFShutdown(void);
+    int32_t __stdcall MFPCreateMediaPlayer(const wchar_t* url, int32_t start, uint32_t options, void* callback, void* hwnd, vt_mfp_t** player);
+    int32_t __stdcall CoInitializeEx(void* reserved, uint32_t coinit);
+    void    __stdcall CoUninitialize(void);
+    int     __stdcall MultiByteToWideChar(uint32_t codepage, uint32_t flags, const char* mb, int mb_len, wchar_t* wide, int wide_len);
+    typedef int32_t (__stdcall* vt_mfp_call_t)(vt_mfp_t*);
+    typedef int32_t (__stdcall* vt_mfp_time_t)(vt_mfp_t*, const vt_guid_t*, vt_propvariant_t*);
+    typedef int32_t (__stdcall* vt_mfp_state_t)(vt_mfp_t*, int32_t*);
+    typedef int32_t (__stdcall* vt_mfp_volume_t)(vt_mfp_t*, float);
+]];
+
+-- IMFPMediaPlayer methods, by their place in its vtable (mfplay.h)
+local MFP = { Release = 2, Play = 3, Pause = 4, Stop = 5, GetPosition = 8, GetDuration = 9,
+              GetState = 13, SetVolume = 20, Shutdown = 38 };
+local MFP_STATE_STOPPED, MFP_STATE_SHUTDOWN = 1, 4;
+local MFP_OPTION_FREE_THREADED_CALLBACK = 1;
+local MF_VERSION = 0x00020070;
+local POSITION_100NS = ffi.new('vt_guid_t');   -- MFP_POSITIONTYPE_100NS is GUID_NULL
+local mf = { ok = false, lib = nil, plat = nil, com = false };
+
+local function mf_start()
+    local ok = pcall(function ()
+        mf.lib  = ffi.load('mfplay');
+        mf.plat = ffi.load('mfplat');
+        local hr = ffi.load('ole32').CoInitializeEx(nil, 2);   -- COINIT_APARTMENTTHREADED; S_FALSE (1) = already so
+        mf.com = (hr == 0 or hr == 1);
+        if mf.plat.MFStartup(MF_VERSION, 0) < 0 then error('MFStartup'); end
+    end);
+    mf.ok = ok;
+end
+
+local function mf_stop()
+    if not mf.ok then return; end
+    pcall(function ()
+        mf.plat.MFShutdown();
+        if mf.com then ffi.load('ole32').CoUninitialize(); end
+    end);
+    mf.ok, mf.com = false, false;
+end
+
+local function mf_open(path, vol)
+    if not mf.ok then return nil, 'Media Foundation is not available'; end
+    local n = ffi.C.MultiByteToWideChar(0, 0, path, -1, nil, 0);   -- the ANSI code page, as the paths are
+    if n <= 0 then return nil, 'bad path'; end
+    local wide = ffi.new('wchar_t[?]', n);
+    ffi.C.MultiByteToWideChar(0, 0, path, -1, wide, n);
+    local out = ffi.new('vt_mfp_t*[1]');
+    local hr = mf.lib.MFPCreateMediaPlayer(wide, 1, MFP_OPTION_FREE_THREADED_CALLBACK, nil, nil, out);
+    if hr < 0 or out[0] == nil then return nil, 'Media Foundation error 0x' .. bit.tohex(hr); end
+    local p = out[0];
+    ffi.cast('vt_mfp_volume_t', p.vtbl[MFP.SetVolume])(p, vol / 100);   -- SetVolume, before any sound: opening runs in the background
+    local function call(i, ct, ...) return ffi.cast(ct, p.vtbl[i])(p, ...); end
+    local pv = ffi.new('vt_propvariant_t');
+    local st = ffi.new('int32_t[1]');
+    local length, opened = 0, os.clock();
+    local last_pos, still = -1, 0;
+
+    local function time_ms(i)
+        pv.vt, pv.hVal = 0, 0;
+        if call(i, 'vt_mfp_time_t', POSITION_100NS, pv) < 0 or (pv.vt ~= 20 and pv.vt ~= 21) then return nil; end   -- VT_I8 / VT_UI8
+        return tonumber(pv.hVal) / 10000;
+    end
+    local dev = { kind = 'mf' };
+    dev.stop   = function () call(MFP.Stop, 'vt_mfp_call_t'); end
+    dev.close  = function ()
+        if p == nil then return; end
+        call(MFP.Shutdown, 'vt_mfp_call_t');
+        call(MFP.Release, 'vt_mfp_call_t');
+        p = nil;
+    end
+    dev.pause  = function () call(MFP.Pause, 'vt_mfp_call_t'); end
+    dev.resume = function () call(MFP.Play, 'vt_mfp_call_t'); end
+    dev.volume = function (v) call(MFP.SetVolume, 'vt_mfp_volume_t', v / 100); end
+    dev.length = function ()
+        if length <= 0 then length = math.floor(time_ms(MFP.GetDuration) or 0); end
+        return length;
+    end
+    -- Over when the player says it has stopped by itself, or its position has stood still at the end.
+    dev.over   = function ()
+        if call(MFP.GetState, 'vt_mfp_state_t', st) >= 0 and (st[0] == MFP_STATE_STOPPED or st[0] == MFP_STATE_SHUTDOWN) then return true; end
+        local pos = time_ms(MFP.GetPosition) or -1;
+        still = (pos == last_pos) and (still + 1) or 0;
+        last_pos = pos;
+        return (length > 0 and pos >= length - 100) or still >= 4;
+    end
+    -- Opening is done in the background: a song that has not shown a length after five seconds never opened.
+    dev.failed = function () return dev.length() <= 0 and os.clock() - opened > 5; end
+    return dev;
+end
+
+-- ---------------------------------------------------------------------------
 -- The game's own Music Volume (Main Menu > Config > Sound), setting 10 of the client's
 -- configuration, read and written the way Ashita's bundled 'config' addon by atom0s does it:
 -- the same two functions, found by the same two signatures.
@@ -141,7 +275,7 @@ local player = {
     tracks        = T{},        -- { name, path, on = T{ bool }, bad = false }
     bag           = T{},        -- shuffle: indexes still to play this round
     current       = 0,
-    alias         = nil,        -- the open MCI device's alias, nil when none is open
+    dev           = nil,        -- the open device (see mci_open / mf_open), nil when none is open
     state         = 'stopped',  -- 'playing' / 'paused' / 'stopped'
     length        = 0,          -- ms
     played_ms     = 0,          -- ms of the song heard up to the last pause
@@ -266,12 +400,12 @@ end
 -- playing
 -- ---------------------------------------------------------------------------
 local function device_stop()
-    if player.alias then mci('stop ' .. player.alias); end
+    if player.dev then player.dev.stop(); end
 end
 
 local function device_close()
-    if player.alias then mci('close ' .. player.alias); end
-    player.alias = nil;
+    if player.dev then player.dev.close(); end
+    player.dev = nil;
     player.length = 0;
     player.played_ms, player.since = 0, nil;
 end
@@ -287,24 +421,27 @@ end
 local function clock_run()  if player.since == nil then player.since = os.clock(); end end
 local function clock_hold() player.played_ms = position_ms(); player.since = nil; end
 
--- Opens a song on a brand-new alias. Only ever called with no device open (device_close first).
+local function volume_pct() return math.max(0, math.min(100, cfg.volume[1])); end
+
+-- Opens a song, on Media Foundation unless that is off, missing or has already failed this song,
+-- then on MCI. Only ever called with no device open (device_close first).
 local function device_open(i)
     local t = player.tracks[i];
     if t == nil then return false; end
-    alias_n = alias_n + 1;
-    local alias = ('vanatunes%d'):format(alias_n);
-    local ok, err = mci(('open "%s" type mpegvideo alias %s'):format(t.path, alias));
-    if ok == nil then
+    local dev, err;
+    if cfg.engine[1] ~= 'mci' and not t.mf_bad then
+        dev, err = mf_open(t.path, volume_pct());
+        if dev == nil then t.mf_bad = true; end
+    end
+    if dev == nil then dev, err = mci_open(t.path, volume_pct()); end
+    if dev == nil then
         t.bad = true;
         say(('cannot play %s: %s'):format(t.name, err));
         return false;
     end
-    player.alias = alias;
+    player.dev = dev;
     player.current = i;
-    mci(('set %s time format milliseconds'):format(alias));
-    player.length = tonumber(mci(('status %s length'):format(alias))) or 0;
-    mci(('setaudio %s volume to %d'):format(alias, math.max(0, math.min(100, cfg.volume[1])) * 10));
-    mci('play ' .. alias);
+    player.length = dev.length();
     player.played_ms, player.since = 0, nil;
     clock_run();
     player.state = 'playing';
@@ -316,7 +453,7 @@ end
 -- Stops now; run_switch closes the device later, once the decoder has had time to wind down.
 local function stop_all(note)
     player.ended = false;
-    if player.alias then
+    if player.dev then
         if player.switch == nil or player.switch.step == 'stop' then
             device_stop();
             clock_hold();
@@ -333,8 +470,8 @@ local function stop_all(note)
 end
 
 local function apply_volume()
-    if player.alias and player.state ~= 'stopped' and not player.switch then
-        mci(('setaudio %s volume to %d'):format(player.alias, math.max(0, math.min(100, cfg.volume[1])) * 10));
+    if player.dev and player.state ~= 'stopped' and not player.switch then
+        player.dev.volume(volume_pct());
     end
 end
 
@@ -359,7 +496,7 @@ local function begin_switch(i)
     player.note = '';
     -- a change already under way keeps its timing and just takes the new song
     if player.switch then player.switch.index = i; return; end
-    player.switch = { step = player.alias and 'stop' or 'open', index = i, at = os.clock() };
+    player.switch = { step = player.dev and 'stop' or 'open', index = i, at = os.clock() };
 end
 
 local function next_track()
@@ -402,8 +539,8 @@ local function play_or_resume()
         end
         return;
     end
-    if player.state == 'paused' and player.alias then
-        mci('resume ' .. player.alias);
+    if player.state == 'paused' and player.dev then
+        player.dev.resume();
         clock_run();
         player.state = 'playing';
         player.held_for_title = false;
@@ -413,8 +550,8 @@ local function play_or_resume()
 end
 
 local function pause()
-    if player.state == 'playing' and player.alias and not player.switch then
-        mci('pause ' .. player.alias);
+    if player.state == 'playing' and player.dev and not player.switch then
+        player.dev.pause();
         clock_hold();
         player.state = 'paused';
     end
@@ -471,11 +608,22 @@ local function tick()
     if not in_game and player.state == 'playing' then pause(); player.held_for_title = true; end
     if in_game and player.held_for_title and player.state == 'paused' then play_or_resume(); end
 
-    -- The device is asked whether the song is over only in its last few seconds (or when its length
-    -- is unknown), and never while a change is under way. The rest of the song it is left alone.
-    if player.alias and player.state == 'playing' and not player.switch then
-        if player.length <= 0 or position_ms() >= player.length - 3000 then
-            if mci(('status %s mode'):format(player.alias)) == 'stopped' then player.ended = true; end
+    -- The device is asked whether the song is over only in its last few seconds (or, on MCI, when its
+    -- length is unknown), and never while a change is under way. The rest of the song it is left alone.
+    -- Media Foundation opens in the background, so its length is picked up once it is known; a song it
+    -- never opens is tried again on MCI.
+    local dev = player.dev;
+    if dev and player.state == 'playing' and not player.switch then
+        if dev.kind == 'mf' and player.length <= 0 then
+            player.length = dev.length();
+            if player.length <= 0 and dev.failed() then
+                local t = player.tracks[player.current];
+                if t then t.mf_bad = true; end
+                say(('%s would not open on Media Foundation; trying the old player.'):format(t and t.name or 'that song'));
+                begin_switch(player.current);
+            end
+        elseif player.length <= 0 or position_ms() >= player.length - 3000 then
+            if dev.over() then player.ended = true; end
         end
     end
 end
@@ -492,6 +640,16 @@ ashita.events.register('command', 'vanatunes_cmd', function (e)
     elseif sub == 'pause' then player.pending:append(pause);
     elseif sub == 'next' then player.pending:append(next_track);
     elseif sub == 'stop' then player.pending:append(function () stop_all(''); end);
+    elseif sub == 'engine' then
+        local want = (args[3] or ''):lower();
+        if want == 'mci' or want == 'auto' then
+            cfg.engine[1] = want; settings.save();
+            for _, t in ipairs(player.tracks) do t.mf_bad = nil; end
+            say(('engine %s: from the next song.'):format(want));
+        else
+            say(('engine %s (Media Foundation %s); playing on %s'):format(cfg.engine[1], mf.ok and 'available' or 'not available',
+                player.dev and player.dev.kind or 'nothing'));
+        end
     elseif sub == 'rescan' then player.pending:append(function () scan(); say(('%d song(s) in %s'):format(#player.tracks, music_dir())); end);
     elseif sub == 'shuffle' then
         cfg.shuffle[1] = not cfg.shuffle[1]; player.bag = T{}; settings.save();
@@ -538,6 +696,7 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
 
         if now_playing and player.state ~= 'stopped' then
             imgui.Text(now_playing.name);
+            if player.dev and player.dev.kind == 'mci' then imgui.SameLine(); imgui.TextDisabled('(old player)'); end
             local at = position_ms();
             local fraction = player.length > 0 and math.min(1, at / player.length) or 0;
             imgui.ProgressBar(fraction, { -1, 14 }, ('%s / %s'):format(clock(at), clock(player.length)));
@@ -587,19 +746,21 @@ end);
 ashita.events.register('load', 'vanatunes_load', function ()
     math.randomseed(os.time());
     find_game_config();
+    mf_start();
     scan();
     say(('loaded, %d song(s). /vanatunes opens the window.'):format(#player.tracks));
 end);
 
 ashita.events.register('unload', 'vanatunes_unload', function ()
     -- the device has to go before we do; still, stop it first and give the decoder a moment
-    if player.alias then
+    if player.dev then
         if player.switch == nil or player.switch.step == 'stop' then device_stop(); end
         ffi.C.Sleep(300);
         device_close();
     end
     player.switch = nil;
     player.state = 'stopped';
+    mf_stop();
     sync_game_music(false);   -- the player's own Music Volume back before we go
     settings.save();
 end);
