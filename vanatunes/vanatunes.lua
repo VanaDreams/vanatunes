@@ -21,12 +21,13 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.3';
+addon.version = '0.3.4';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
 require('common');
 local imgui    = require('imgui');
+local vd       = require('vdstyle');
 local settings = require('settings');
 local ffi      = require('ffi');
 
@@ -513,7 +514,7 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
     tick();
     if not cfg.window_open[1] then return; end
     imgui.SetNextWindowSize({ 380, 0 }, ImGuiCond_FirstUseEver);
-    if imgui.Begin(('vanatunes %s###vanatunes'):format(addon.version), cfg.window_open) then
+    if vd.Begin(('vanatunes %s###vanatunes'):format(addon.version), cfg.window_open) then
         local now_playing = player.tracks[player.current];
 
         -- Which music you are hearing, one press either way.
@@ -527,17 +528,17 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         imgui.Separator();
 
         if player.state == 'playing' then
-            if imgui.Button('Pause', { 80, 26 }) then pause(); end
+            if vd.Button('Pause', { 80, 26 }, true) then pause(); end
         else
-            if imgui.Button('Play', { 80, 26 }) then play_or_resume(); end
+            if vd.Button('Play', { 80, 26 }, true) then play_or_resume(); end
         end
         imgui.SameLine();
-        if imgui.Button('Next', { 80, 26 }) then next_track(); end
+        if vd.Button('Next', { 80, 26 }) then next_track(); end
         imgui.SameLine();
-        if imgui.Button('Stop', { 80, 26 }) then stop_all(''); end
+        if vd.Button('Stop', { 80, 26 }) then stop_all(''); end
 
         if now_playing and player.state ~= 'stopped' then
-            imgui.Text(now_playing.name);
+            vd.Eyebrow(now_playing.name);
             local at = position_ms();
             local fraction = player.length > 0 and math.min(1, at / player.length) or 0;
             imgui.ProgressBar(fraction, { -1, 14 }, ('%s / %s'):format(clock(at), clock(player.length)));
@@ -560,12 +561,12 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         imgui.Separator();
         imgui.Text(('%d song(s)'):format(#player.tracks));
         imgui.SameLine();
-        if imgui.Button('Rescan') then scan(); end
+        if vd.Button('Rescan') then scan(); end
         imgui.BeginChild('vanatunes_songs', { 0, 200 }, ImGuiChildFlags_Borders);
         for i, t in ipairs(player.tracks) do
             if imgui.Checkbox('##on' .. i, t.on) then player.bag = T{}; save_skipped(); end
             imgui.SameLine();
-            if imgui.Selectable(t.name .. (t.bad and '  (will not play)' or '') .. '##song' .. i, i == player.current and player.state ~= 'stopped') then
+            if vd.Selectable(t.name .. (t.bad and '  (will not play)' or '') .. '##song' .. i, i == player.current and player.state ~= 'stopped') then
                 play_index(i);
             end
         end
@@ -578,7 +579,7 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
             imgui.TextDisabled('Leave it empty for the folder above, then Rescan.');
         end
     end
-    imgui.End();
+    vd.End();
 end);
 
 -- ---------------------------------------------------------------------------
