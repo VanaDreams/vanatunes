@@ -39,3 +39,5 @@ Shuffle plays every ticked song once before any repeats, and never the same song
 ## Settings
 
 Kept per character by Ashita's settings library under `config\addons\vanatunes\`.
+
+The window has a **see-through / solid** switch in its title bar, beside the moon, so the game can show through it; the choice is remembered.
