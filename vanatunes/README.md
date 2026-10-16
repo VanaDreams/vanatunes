@@ -2,7 +2,7 @@
 
 Your own playlist in game, as an Ashita v4 addon. Put songs in a folder, turn shuffle on, and it plays from the list wherever you are instead of being tied to the one tune each zone has. It moves to another song when one ends.
 
-The songs are played by Windows itself, beside the game. No game track is forced or replaced and nothing is converted. While one of yours is playing, the game's own Music Volume is turned down for you, and it goes back to where you had it the moment yours stops.
+The songs are played by Windows itself, beside the game, on Media Foundation (the engine behind the Windows Media Player app). No game track is forced or replaced and nothing is converted. A song Windows cannot open is marked "(will not play)" and skipped. A PC without Media Foundation (Windows N editions) plays on the older Windows player instead; the window shows "(old player)" beside the song when that happens. While one of yours is playing, the game's own Music Volume is turned down for you, and it goes back to where you had it the moment yours stops.
 
 **My music / Game music** at the top of the window switches between the two in one press.
 
@@ -32,6 +32,9 @@ Your own songs go in **Vanadreams Music** on your Desktop (the addon makes the f
 /vanatunes shuffle
 /vanatunes volume 40
 /vanatunes rescan
+/vanatunes engine        which player is in use
+/vanatunes engine mci    always the older Windows player
+/vanatunes engine auto   back to Media Foundation
 ```
 
 Shuffle plays every ticked song once before any repeats, and never the same song twice in a row.
