@@ -47,7 +47,7 @@ local defaults = T{
     focus_only  = T{ false },    -- only the game window you are in makes sound: the others go quiet until you switch to them
     sfx_mute    = T{ false },    -- also silence the game's sound effects while a song of ours plays
     sfx_before  = -1,            -- the player's Sound Effects volume, kept while it is silenced; -1 = not silenced
-    mount_keep  = T{ false },    -- keep the zone's music while riding a mount instead of the mount song
+    mount_keep  = T{ true },    -- keep the zone's music while riding a mount instead of the mount song
     mount_drop  = T{ false },    -- with mount_keep: drop the mount music packet instead of emptying it
 };
 
