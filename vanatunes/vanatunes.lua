@@ -17,11 +17,12 @@
       /vanatunes shuffle       shuffle on or off
       /vanatunes volume 0-100  how loud
       /vanatunes rescan        read the folder again
+      /vanatunes mount on|off  keep the zone music while riding a mount
 ]]
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.5';
+addon.version = '0.3.6';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -46,6 +47,8 @@ local defaults = T{
     sfx_mute    = T{ false },    -- also silence the game's sound effects while a song of ours plays
     sfx_id      = 0,             -- the client's configuration id of its sound effects volume; 0 = not found yet
     sfx_before  = -1,            -- the player's sound effects volume, kept while it is silenced; -1 = not silenced
+    mount_keep  = T{ false },    -- keep the zone's music while riding a mount instead of the mount song
+    mount_drop  = T{ false },    -- with mount_keep: drop the mount music packet instead of emptying it
 };
 
 local cfg = settings.load(defaults);
@@ -477,6 +480,22 @@ local function sync_game_sfx(ours_is_sounding)
     end
 end
 
+-- Riding a mount makes the server send one music packet (0x05F) for the mount slot (4) with the
+-- chocobo or mount song. With "keep the zone music" ticked, the track number in that packet is
+-- emptied as it arrives (or the packet dropped), so the zone music carries on. Nothing is sent
+-- to the server.
+local MUSIC_PACKET, SLOT_MOUNT = 0x05F, 4;
+
+ashita.events.register('packet_in', 'vanatunes_mount', function (e)
+    if not cfg.mount_keep[1] or e.id ~= MUSIC_PACKET or e.size < 8 then return; end
+    if struct.unpack('H', e.data, 0x04 + 1) ~= SLOT_MOUNT then return; end
+    if cfg.mount_drop[1] then
+        e.blocked = true;
+    else
+        ffi.cast('uint16_t*', e.data_modified_raw + 0x06)[0] = 0;
+    end
+end);
+
 local function tick()
     while #player.pending > 0 do table.remove(player.pending, 1)(); end
 
@@ -533,6 +552,10 @@ ashita.events.register('command', 'vanatunes_cmd', function (e)
     elseif sub == 'shuffle' then
         cfg.shuffle[1] = not cfg.shuffle[1]; player.bag = T{}; settings.save();
         say('shuffle ' .. (cfg.shuffle[1] and 'on' or 'off'));
+    elseif sub == 'mount' then
+        local on = (args[3] or ''):lower();
+        if on == 'on' or on == 'off' then cfg.mount_keep[1] = (on == 'on'); settings.save(); end
+        say('zone music while riding a mount: ' .. (cfg.mount_keep[1] and 'kept' or 'off') .. '. Takes effect the next time you mount.');
     elseif sub == 'volume' then
         local v = tonumber(args[3]);
         if v == nil then say('volume is ' .. cfg.volume[1]); return; end
@@ -630,6 +653,8 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
             end
             if sfx_find.note ~= '' then imgui.TextDisabled(sfx_find.note); end
         end
+        if imgui.Checkbox('Keep the zone music while riding a mount', cfg.mount_keep) then changed = true; end
+        if cfg.mount_keep[1] and imgui.Checkbox('Drop the mount music instead of emptying it', cfg.mount_drop) then changed = true; end
         if changed then settings.save(); end
 
         imgui.Separator();
