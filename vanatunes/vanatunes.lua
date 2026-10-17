@@ -21,7 +21,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.4';
+addon.version = '0.3.5';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -43,6 +43,9 @@ local defaults = T{
     skipped     = T{},           -- file names unticked in the list
     game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
     game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
+    sfx_mute    = T{ false },    -- also silence the game's sound effects while a song of ours plays
+    sfx_id      = 0,             -- the client's configuration id of its sound effects volume; 0 = not found yet
+    sfx_before  = -1,            -- the player's sound effects volume, kept while it is silenced; -1 = not silenced
 };
 
 local cfg = settings.load(defaults);
@@ -131,6 +134,21 @@ local function find_game_config()
         game.set = ffi.cast('vt_set_config_t', set_ptr);
     end);
     game.ok = ok and game.get ~= nil and game.set ~= nil;
+end
+
+-- The sound effects volume is found on the player's own client rather than guessed: the window
+-- reads every configuration value, asks the player to move Sound Effects in Config > Sound, reads
+-- them again, and the one value that moved is the setting.
+local MAX_CONFIG_ID = 207;   -- the highest id Ashita's 'config' addon accepts
+local sfx_find = { before = nil, note = '' };
+
+local function config_snapshot()
+    local snap = {};
+    for id = 1, MAX_CONFIG_ID do
+        local ok, v = pcall(game.get, id);
+        if ok then snap[id] = v; end
+    end
+    return snap;
 end
 
 -- ---------------------------------------------------------------------------
@@ -442,6 +460,23 @@ local function sync_game_music(ours_is_sounding)
     end
 end
 
+-- The same for the game's sound effects, when the player asked for them silenced too: kept in the
+-- settings file, so they are put right after a crash as well.
+local function sync_game_sfx(ours_is_sounding)
+    if not game.ok or cfg.sfx_id == 0 then return; end
+    if ours_is_sounding and cfg.sfx_mute[1] then
+        if cfg.sfx_before == -1 then
+            cfg.sfx_before = game.get(cfg.sfx_id);
+            settings.save();
+        end
+        if game.get(cfg.sfx_id) ~= 0 then game.set(cfg.sfx_id, 0); end
+    elseif cfg.sfx_before ~= -1 then
+        game.set(cfg.sfx_id, cfg.sfx_before);
+        cfg.sfx_before = -1;
+        settings.save();
+    end
+end
+
 local function tick()
     while #player.pending > 0 do table.remove(player.pending, 1)(); end
 
@@ -464,6 +499,7 @@ local function tick()
 
     local in_game = logged_in();
     sync_game_music(in_game and player.state == 'playing');
+    sync_game_sfx(in_game and player.state == 'playing');
     if in_game and cfg.autoplay[1] and not player.auto_started then
         player.auto_started = true;
         if player.state == 'stopped' and #player.tracks > 0 then next_track(); end
@@ -555,6 +591,44 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         if imgui.SliderInt('Volume', cfg.volume, 0, 100) then apply_volume(); changed = true; end
         if game.ok then
             changed = imgui.SliderInt('Game music under mine', cfg.game_music, 0, 100) or changed;
+            if imgui.Checkbox('Silence the game\'s sound effects too', cfg.sfx_mute) then
+                if cfg.sfx_id == 0 then cfg.sfx_mute[1] = false; sfx_find.note = 'Find the setting first, below.'; end
+                changed = true;
+            end
+            if cfg.sfx_id == 0 or sfx_find.before ~= nil then
+                if sfx_find.before == nil then
+                    if vd.Button('Find the sound effects setting') then
+                        sync_game_sfx(false);
+                        sfx_find.before = config_snapshot();
+                        sfx_find.note = 'Now open Config > Sound, move Sound Effects to another number, then press the button again.';
+                    end
+                else
+                    if vd.Button('I moved it, find it now') then
+                        local now, moved = config_snapshot(), T{};
+                        for id, v in pairs(sfx_find.before) do
+                            if now[id] ~= nil and now[id] ~= v then moved:append(id); end
+                        end
+                        sfx_find.before = nil;
+                        if #moved == 1 then
+                            cfg.sfx_id = moved[1];
+                            changed = true;
+                            sfx_find.note = 'Found it. Tick the box to use it.';
+                            say(('sound effects volume found: configuration id %d.'):format(cfg.sfx_id));
+                        elseif #moved == 0 then
+                            sfx_find.note = 'Nothing changed. Try again, and move Sound Effects before pressing.';
+                        else
+                            sfx_find.note = ('%d settings changed, so I cannot tell which. Try again and touch only Sound Effects.'):format(#moved);
+                        end
+                    end
+                end
+            elseif vd.Button('Find it again') then
+                sync_game_sfx(false);
+                cfg.sfx_id = 0;
+                cfg.sfx_mute[1] = false;
+                sfx_find.note = '';
+                changed = true;
+            end
+            if sfx_find.note ~= '' then imgui.TextDisabled(sfx_find.note); end
         end
         if changed then settings.save(); end
 
@@ -602,5 +676,6 @@ ashita.events.register('unload', 'vanatunes_unload', function ()
     player.switch = nil;
     player.state = 'stopped';
     sync_game_music(false);   -- the player's own Music Volume back before we go
+    sync_game_sfx(false);     -- and their sound effects
     settings.save();
 end);
