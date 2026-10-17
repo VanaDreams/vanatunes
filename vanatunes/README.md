@@ -34,7 +34,7 @@ Your own songs go in **Vanadreams Music** on your Desktop (the addon makes the f
 /vanatunes rescan
 ```
 
-**Silence the game's sound effects too** (off by default) is for playing more than one character at once, or when you only want your songs. While a song of yours plays, the addon runs the game's own `/mutese on`, and `/mutese off` when the song pauses or stops. If the game closes in between, the next load puts it right.
+**Silence the game's sound effects too** (off by default) is for playing more than one character at once, or when you only want your songs. While a song of yours plays, the game's Sound Effects volume goes to 0, and it goes back to what you had when the song pauses or stops, at the title screen and when the addon unloads.
 
 Shuffle plays every ticked song once before any repeats, and never the same song twice in a row.
 

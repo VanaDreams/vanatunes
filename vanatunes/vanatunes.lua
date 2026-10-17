@@ -44,7 +44,7 @@ local defaults = T{
     game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
     game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
     sfx_mute    = T{ false },    -- also silence the game's sound effects while a song of ours plays
-    sfx_muted   = false,         -- true while we have the game's sound effects muted (kept so a crash is put right)
+    sfx_before  = -1,            -- the player's Sound Effects volume, kept while it is silenced; -1 = not silenced
 };
 
 local cfg = settings.load(defaults);
@@ -122,6 +122,7 @@ ffi.cdef[[
     typedef int32_t (__cdecl* vt_set_config_t)(int32_t, int32_t);
 ]];
 local GAME_MUSIC_VOLUME = 10;
+local GAME_SFX_VOLUME   = 9;    -- Sound Effects, read off the client's saved settings by moving it in Config > Sound
 local game = { get = nil, set = nil, ok = false };
 
 local function find_game_config()
@@ -444,19 +445,19 @@ local function sync_game_music(ours_is_sounding)
     end
 end
 
--- The same for the game's sound effects, when the player asked for them silenced too. The game has
--- its own commands for it, /mutese on and /mutese off, so nothing about the client's configuration
--- is touched here. That we have muted them is kept in the settings file, so they are put right after a
--- crash as well.
+-- The same for the game's Sound Effects volume, when the player asked for it silenced too: the player's
+-- own number is kept in the settings file, so a crash is put right the next time the addon loads.
 local function sync_game_sfx(ours_is_sounding)
-    local want = ours_is_sounding and cfg.sfx_mute[1];
-    if want and not cfg.sfx_muted then
-        AshitaCore:GetChatManager():QueueCommand(1, '/mutese on');
-        cfg.sfx_muted = true;
-        settings.save();
-    elseif not want and cfg.sfx_muted then
-        AshitaCore:GetChatManager():QueueCommand(1, '/mutese off');
-        cfg.sfx_muted = false;
+    if not game.ok then return; end
+    if ours_is_sounding and cfg.sfx_mute[1] then
+        if cfg.sfx_before == -1 then
+            cfg.sfx_before = game.get(GAME_SFX_VOLUME);
+            settings.save();
+        end
+        if game.get(GAME_SFX_VOLUME) ~= 0 then game.set(GAME_SFX_VOLUME, 0); end
+    elseif cfg.sfx_before ~= -1 then
+        game.set(GAME_SFX_VOLUME, cfg.sfx_before);
+        cfg.sfx_before = -1;
         settings.save();
     end
 end
@@ -609,7 +610,7 @@ end);
 ashita.events.register('load', 'vanatunes_load', function ()
     math.randomseed(os.time());
     find_game_config();
-    sync_game_sfx(false);   -- sound effects left muted by a crash or an unload before the game ran the command
+    sync_game_sfx(false);   -- Sound Effects left silenced by a crash
     scan();
     say(('loaded, %d song(s). /vanatunes opens the window.'):format(#player.tracks));
 end);
