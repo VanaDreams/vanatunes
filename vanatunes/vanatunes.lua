@@ -21,7 +21,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.4';
+addon.version = '0.3.5';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -43,6 +43,9 @@ local defaults = T{
     skipped     = T{},           -- file names unticked in the list
     game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
     game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
+    focus_only  = T{ false },    -- only the game window you are in makes sound: the others go quiet until you switch to them
+    sfx_mute    = T{ false },    -- also silence the game's sound effects while a song of ours plays
+    sfx_before  = -1,            -- the player's Sound Effects volume, kept while it is silenced; -1 = not silenced
 };
 
 local cfg = settings.load(defaults);
@@ -120,6 +123,7 @@ ffi.cdef[[
     typedef int32_t (__cdecl* vt_set_config_t)(int32_t, int32_t);
 ]];
 local GAME_MUSIC_VOLUME = 10;
+local GAME_SFX_VOLUME   = 9;    -- Sound Effects, read off the client's saved settings by moving it in Config > Sound
 local game = { get = nil, set = nil, ok = false };
 
 local function find_game_config()
@@ -131,6 +135,26 @@ local function find_game_config()
         game.set = ffi.cast('vt_set_config_t', set_ptr);
     end);
     game.ok = ok and game.get ~= nil and game.set ~= nil;
+end
+
+-- Whether the window in front is this game's: the addon runs inside the game's own process, so the
+-- window in front is ours when it belongs to the process we are in.
+ffi.cdef[[
+    void*    GetForegroundWindow(void);
+    uint32_t GetWindowThreadProcessId(void* hwnd, uint32_t* pid);
+    uint32_t GetCurrentProcessId(void);
+]];
+local own_pid = nil;
+local function window_in_front()
+    local ok, yes = pcall(function ()
+        local hwnd = ffi.C.GetForegroundWindow();
+        if hwnd == nil then return false; end
+        own_pid = own_pid or ffi.C.GetCurrentProcessId();
+        local pid = ffi.new('uint32_t[1]');
+        ffi.C.GetWindowThreadProcessId(hwnd, pid);
+        return pid[0] == own_pid;
+    end);
+    return ok and yes;
 end
 
 -- ---------------------------------------------------------------------------
@@ -155,6 +179,7 @@ local player = {
     folder_shown  = T{ '' },
     -- a song change in steps, well apart in time, so the decoder is never torn down while it unwinds
     switch        = nil,        -- { step = 'stop'|'close'|'open', index = n (0: open nothing), at = os.clock() } or nil
+    in_front      = nil,        -- whether this game's window was in front at the last look; nil = not looked yet
     ended         = false,      -- the device reported the song over; picked up next frame
 };
 
@@ -421,25 +446,34 @@ local function pause()
     end
 end
 
--- While a song of ours is sounding the game's Music Volume is turned down to cfg.game_music;
--- the moment ours is not sounding (paused, stopped, title screen, unloaded) it goes back to what
--- the player had. What they had is kept in the settings file, so a crash with the music turned
--- down is put right the next time the addon loads.
-local function sync_game_music(ours_is_sounding)
-    if not game.ok then return; end
-    if ours_is_sounding then
-        local want = math.max(0, math.min(100, cfg.game_music[1]));
-        if cfg.game_music_before == -1 then
-            cfg.game_music_before = game.get(GAME_MUSIC_VOLUME);
+-- The game's Music and Sound Effects volumes. A volume is only ever turned down, and the player's own
+-- number is kept in the settings file while it is, so a crash is put right the next time the addon
+-- loads. want = nil gives the player's number back.
+local function set_volume(id, before_key, want)
+    if want ~= nil then
+        if cfg[before_key] == -1 then
+            cfg[before_key] = game.get(id);
             settings.save();
         end
-        want = math.min(want, cfg.game_music_before);   -- turned down, never up
-        if game.get(GAME_MUSIC_VOLUME) ~= want then game.set(GAME_MUSIC_VOLUME, want); end
-    elseif cfg.game_music_before ~= -1 then
-        game.set(GAME_MUSIC_VOLUME, cfg.game_music_before);
-        cfg.game_music_before = -1;
+        want = math.min(want, cfg[before_key]);
+        if game.get(id) ~= want then game.set(id, want); end
+    elseif cfg[before_key] ~= -1 then
+        game.set(id, cfg[before_key]);
+        cfg[before_key] = -1;
         settings.save();
     end
+end
+
+-- While a song of ours is sounding the game's Music Volume is turned down to cfg.game_music, and its
+-- Sound Effects to 0 if the player asked for that; in a window that is not in front, with the
+-- 'only the window I am in' box ticked, both go to 0. The moment none of that applies they go back.
+local function sync_game_sound(ours_is_sounding, in_front)
+    if not game.ok then return; end
+    local hush = cfg.focus_only[1] and not in_front;
+    set_volume(GAME_MUSIC_VOLUME, 'game_music_before',
+               hush and 0 or (ours_is_sounding and math.max(0, math.min(100, cfg.game_music[1])) or nil));
+    set_volume(GAME_SFX_VOLUME, 'sfx_before',
+               (hush or (ours_is_sounding and cfg.sfx_mute[1])) and 0 or nil);
 end
 
 local function tick()
@@ -458,12 +492,19 @@ local function tick()
         if i == 0 then player.state = 'stopped'; player.note = 'Nothing ticked that will play.'; end
     end
 
+    -- alt-tabbing is picked up on the very next frame, so the sound moves with you
+    local front = window_in_front();
+    if front ~= player.in_front then
+        player.in_front = front;
+        sync_game_sound(logged_in() and player.state == 'playing', front);
+    end
+
     local t = os.clock();
     if t < player.next_poll then return; end
     player.next_poll = t + 0.5;
 
     local in_game = logged_in();
-    sync_game_music(in_game and player.state == 'playing');
+    sync_game_sound(in_game and player.state == 'playing', front);
     if in_game and cfg.autoplay[1] and not player.auto_started then
         player.auto_started = true;
         if player.state == 'stopped' and #player.tracks > 0 then next_track(); end
@@ -556,6 +597,9 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         if game.ok then
             changed = imgui.SliderInt('Game music under mine', cfg.game_music, 0, 100) or changed;
         end
+        if imgui.Checkbox('Silence the game\'s sound effects too', cfg.sfx_mute) then changed = true; end
+        if imgui.Checkbox('Only the game window I am in makes sound', cfg.focus_only) then changed = true; end
+        if cfg.focus_only[1] then imgui.TextDisabled('For several game windows: alt-tab and the sound comes with you.'); end
         if changed then settings.save(); end
 
         imgui.Separator();
@@ -588,6 +632,7 @@ end);
 ashita.events.register('load', 'vanatunes_load', function ()
     math.randomseed(os.time());
     find_game_config();
+    sync_game_sound(false, true);   -- anything left turned down by a crash
     scan();
     say(('loaded, %d song(s). /vanatunes opens the window.'):format(#player.tracks));
 end);
@@ -601,6 +646,6 @@ ashita.events.register('unload', 'vanatunes_unload', function ()
     end
     player.switch = nil;
     player.state = 'stopped';
-    sync_game_music(false);   -- the player's own Music Volume back before we go
+    sync_game_sound(false, true);   -- the player's own Music and Sound Effects volumes back before we go
     settings.save();
 end);
