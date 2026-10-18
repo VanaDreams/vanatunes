@@ -38,6 +38,8 @@ Your own songs go in **Vanadreams Music** on your Desktop (the addon makes the f
 
 **Only the game window I am in makes sound** (off by default) is for playing the game in more than one window. Only the window in front plays its game music and sound effects, the others go quiet, and when you alt-tab the sound comes with you. It reads which window is in front and uses the game's own Music and Sound Effects volumes, and gives each back to the number you had.
 
+**Keep the zone music while riding a mount** (on by default; untick it to hear the mount song again) stops the chocobo or mount song from taking over when you mount, so the zone's own music carries on. It changes the one music message the server sends when you mount, on your side only; nothing is sent back to the server and no game files change. If riding then leaves you with silence, also tick **Drop the mount music instead of emptying it**. `/vanatunes mount on` and `/vanatunes mount off` do the same from the chat line. It takes effect the next time you mount. The server plays no music while fishing, so there is nothing to change there.
+
 Shuffle plays every ticked song once before any repeats, and never the same song twice in a row.
 
 ## Settings
