@@ -1,1 +1,2 @@
-mp3, wav, wma or m4a files in this folder are the Vanadreams playlist.
+mp3, wav, wma or m4a files in this folder play under VanaTunes Vol. 1.
+Make a folder inside this one for another album; its name becomes a tab.

@@ -18,7 +18,7 @@ Copy this folder to `Ashita-v4beta\addons\vanatunes\`, then in game:
 
 ## Use
 
-The songs already in the addon's `music` folder appear under **VanaTunes Vol. 1**. To ship another album, make a folder directly inside `vanatunes/music`, such as `vanatunes/music/Bumper Mania/`, and put its audio files there. Its folder name becomes a playlist tab. Press **Reinstall** on the launcher's Addons page to receive new albums or songs. The launcher copies album subfolders as well as the existing songs.
+The songs already in the addon's `music` folder appear under **VanaTunes Vol. 1**. The songs in `vanatunes/music/Bumper's Beats/` appear under **Bumper's Beats**. To ship another album, make a folder directly inside `vanatunes/music` and put its audio files there. Its folder name becomes a playlist tab. Press **Reinstall** on the launcher's Addons page to receive new albums or songs. The launcher copies album subfolders as well as the existing songs.
 
 Your own loose songs go in **Vanadreams Music** on your Desktop (the addon makes the folder), under **My Songs**. Make a folder inside it for each personal album; for example, `Desktop/Vanadreams Music/Road Trip/` becomes **Road Trip (Mine)**. You can also point Folder in the window at a different music location. Press **Rescan** after adding or removing folders or songs. Folders with no playable audio files do not show a tab.
 
