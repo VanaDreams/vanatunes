@@ -22,7 +22,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.6';
+addon.version = '0.3.7';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -42,6 +42,7 @@ local defaults = T{
     autoplay    = T{ false },    -- start playing once you are in game; off until the player asks
     volume      = T{ 60 },       -- 0-100
     skipped     = T{},           -- file names unticked in the list
+    album       = '',            -- selected playlist tab
     game_music  = T{ 0 },        -- the game's own Music Volume while a song of ours plays, 0-100
     game_music_before = -1,      -- the player's Music Volume, kept while ours is turned down; -1 = not turned down
     focus_only  = T{ false },    -- only the game window you are in makes sound: the others go quiet until you switch to them
@@ -167,6 +168,8 @@ local EXTENSIONS = T{ mp3 = true, wav = true, wma = true, m4a = true };
 
 local player = {
     tracks        = T{},        -- { name, path, on = T{ bool }, bad = false }
+    albums        = T{},        -- { id, name, tracks = T{ indexes } }
+    select_tab_on_draw = true,
     bag           = T{},        -- shuffle: indexes still to play this round
     current       = 0,
     alias         = nil,        -- the open MCI device's alias, nil when none is open
@@ -226,39 +229,99 @@ end
 -- ---------------------------------------------------------------------------
 local function save_skipped()
     local skipped = T{};
-    for _, t in ipairs(player.tracks) do if not t.on[1] then skipped:append(t.name); end end
+    for _, t in ipairs(player.tracks) do if not t.on[1] then skipped:append(t.id); end end
     cfg.skipped = skipped;
     settings.save();
+end
+
+-- Enumerate only immediate subfolders. The API used for song files does not distinguish a
+-- folder from a file, so ask Windows for the directory attribute here.
+ffi.cdef[[
+    typedef struct {
+        uint32_t attributes, created_low, created_high, accessed_low, accessed_high;
+        uint32_t written_low, written_high, size_high, size_low, reserved0, reserved1;
+        char name[260], alternate[14];
+    } vt_find_data_t;
+    void* __stdcall FindFirstFileA(const char* pattern, vt_find_data_t* data);
+    int __stdcall FindNextFileA(void* handle, vt_find_data_t* data);
+    int __stdcall FindClose(void* handle);
+]];
+local kernel32 = ffi.load('kernel32');
+local function subfolders(dir)
+    local result = T{};
+    local data = ffi.new('vt_find_data_t');
+    local handle = kernel32.FindFirstFileA(dir .. '*', data);
+    if handle == ffi.cast('void*', -1) then return result; end
+    repeat
+        local name = ffi.string(data.name);
+        if name ~= '.' and name ~= '..' and bit.band(data.attributes, 0x10) ~= 0 then
+            result:append(name);
+        end
+    until kernel32.FindNextFileA(handle, data) == 0;
+    kernel32.FindClose(handle);
+    table.sort(result, function (a, b) return a:lower() < b:lower(); end);
+    return result;
 end
 
 local function scan()
     local dir = music_dir();
     if not ashita.fs.exists(dir) then ashita.fs.create_directory(dir); end
     local playing_path = player.tracks[player.current] and player.tracks[player.current].path or nil;
+    local switching_path = player.switch and player.tracks[player.switch.index]
+                           and player.tracks[player.switch.index].path or nil;
     local skipped = {};
     for _, name in ipairs(cfg.skipped) do skipped[name] = true; end
 
-    -- The player's own folder first, then the songs that came with the addon (addons\vanatunes\music,
-    -- which the launcher fills from the vanatunes repo). A name in both is listed once, the player's.
+    -- Root files remain valid playlists for existing installs. Each direct subfolder is an album.
     local found = T{};
-    local seen = {};
-    for _, from in ipairs({ dir, shipped_dir() }) do
-        if ashita.fs.exists(from) then
-            for _, name in ipairs(ashita.fs.get_dir(from, '.*', false) or {}) do
+    local albums = T{};
+    local function add_album(id, label, path)
+        if not ashita.fs.exists(path) then return; end
+        local album = { id = id, name = label, tracks = T{} };
+        for _, name in ipairs(ashita.fs.get_dir(path, '.*', false) or {}) do
                 local ext = name:match('%.([^%.\\/]+)$');
-                if ext and EXTENSIONS[ext:lower()] and not seen[name:lower()] then
-                    seen[name:lower()] = true;
-                    found:append({ name = name, path = from .. name, on = T{ not skipped[name] }, bad = false });
+                if ext and EXTENSIONS[ext:lower()] then
+                    local track_id = id .. '/' .. name:lower();
+                    found:append({ id = track_id, album = id, name = name, path = path .. name,
+                                   on = T{ not skipped[track_id] and not skipped[name] }, bad = false });
+                    album.tracks:append(#found);
                 end
-            end
         end
+        if #album.tracks > 0 then albums:append(album); end
     end
-    table.sort(found, function (a, b) return a.name:lower() < b.name:lower(); end);
+    local shipped = shipped_dir();
+    add_album('shipped/root', 'VanaTunes Vol. 1', shipped);
+    for _, name in ipairs(subfolders(shipped)) do
+        add_album('shipped/' .. name:lower(), name, shipped .. name .. '\\');
+    end
+    add_album('mine/root', 'My Songs', dir);
+    for _, name in ipairs(subfolders(dir)) do
+        add_album('mine/' .. name:lower(), name .. ' (Mine)', dir .. name .. '\\');
+    end
+    -- Sorting the tracks within each album leaves album order predictable.
+    for _, album in ipairs(albums) do
+        table.sort(album.tracks, function (a, b) return found[a].name:lower() < found[b].name:lower(); end);
+    end
+    player.albums = albums;
+    local selected = nil;
+    for _, album in ipairs(albums) do
+        if album.id == cfg.album then selected = album; break; end
+    end
+    if not selected then
+        selected = albums[1];
+        cfg.album = selected and selected.id or '';
+        settings.save();
+    end
 
     player.tracks = found;
     player.bag = T{};
     player.current = 0;
     for i, t in ipairs(found) do if t.path == playing_path then player.current = i; end end
+    if player.switch and player.switch.index ~= 0 then
+        player.switch.index = 0;
+        for i, t in ipairs(found) do if t.path == switching_path then player.switch.index = i; break; end end
+    end
+    player.select_tab_on_draw = true;
     player.folder_shown[1] = dir;
     player.note = (#found == 0) and ('No songs yet. Put mp3 or wav files in ' .. dir)
                or (player.state == 'stopped' and 'Press My music to start the playlist.' or '');
@@ -266,16 +329,19 @@ end
 
 local function playable(i)
     local t = player.tracks[i];
-    return t ~= nil and t.on[1] and not t.bad;
+    return t ~= nil and t.album == cfg.album and t.on[1] and not t.bad;
 end
 
 -- Shuffle plays every ticked song once before any repeats, and never the same song twice in a row.
 local function pick_next()
-    local n = #player.tracks;
+    local album = nil;
+    for _, a in ipairs(player.albums) do if a.id == cfg.album then album = a; break; end end
+    local indexes = album and album.tracks or T{};
+    local n = #indexes;
     if n == 0 then return 0; end
     if cfg.shuffle[1] then
         if #player.bag == 0 then
-            for i = 1, n do if playable(i) and i ~= player.current then player.bag:append(i); end end
+            for _, i in ipairs(indexes) do if playable(i) and i ~= player.current then player.bag:append(i); end end
             if #player.bag == 0 and playable(player.current) then player.bag:append(player.current); end
         end
         while #player.bag > 0 do
@@ -285,7 +351,9 @@ local function pick_next()
         return 0;
     end
     for step = 1, n do
-        local i = ((player.current - 1 + step) % n) + 1;
+        local current_slot = 0;
+        for slot, index in ipairs(indexes) do if index == player.current then current_slot = slot; break; end end
+        local i = indexes[((current_slot + step - 1) % n) + 1];
         if playable(i) then return i; end
     end
     return 0;
@@ -393,6 +461,15 @@ end
 
 local function next_track()
     begin_switch(choose_playable());
+end
+
+local function select_album(id)
+    if cfg.album == id then return; end
+    cfg.album = id;
+    player.bag = T{};
+    settings.save();
+    if player.state == 'playing' or player.switch then next_track(); end
+    if player.state == 'paused' then stop_all('Press Play to start this album.'); end
 end
 
 local function play_index(i)
@@ -553,7 +630,7 @@ ashita.events.register('command', 'vanatunes_cmd', function (e)
     elseif sub == 'pause' then player.pending:append(pause);
     elseif sub == 'next' then player.pending:append(next_track);
     elseif sub == 'stop' then player.pending:append(function () stop_all(''); end);
-    elseif sub == 'rescan' then player.pending:append(function () scan(); say(('%d song(s) in %s'):format(#player.tracks, music_dir())); end);
+    elseif sub == 'rescan' then player.pending:append(function () scan(); say(('%d song(s) in %d album(s)'):format(#player.tracks, #player.albums)); end);
     elseif sub == 'shuffle' then
         cfg.shuffle[1] = not cfg.shuffle[1]; player.bag = T{}; settings.save();
         say('shuffle ' .. (cfg.shuffle[1] and 'on' or 'off'));
@@ -628,11 +705,28 @@ ashita.events.register('d3d_present', 'vanatunes_present', function ()
         if changed then settings.save(); end
 
         imgui.Separator();
-        imgui.Text(('%d song(s)'):format(#player.tracks));
+        local album = nil;
+        for _, a in ipairs(player.albums) do if a.id == cfg.album then album = a; break; end end
+        imgui.Text(('%d album(s)'):format(#player.albums));
         imgui.SameLine();
         if vd.Button('Rescan') then scan(); end
+        if imgui.BeginTabBar('vanatunes_albums', ImGuiTabBarFlags_None) then
+            for _, a in ipairs(player.albums) do
+                local flags = (player.select_tab_on_draw and a.id == cfg.album)
+                              and ImGuiTabItemFlags_SetSelected or 0;
+                if imgui.BeginTabItem(a.name .. '##' .. a.id, nil, flags) then
+                    if not player.select_tab_on_draw then select_album(a.id); end
+                    album = a;
+                    imgui.EndTabItem();
+                end
+            end
+            imgui.EndTabBar();
+            player.select_tab_on_draw = false;
+        end
+        imgui.Text(('%d song(s) in this album'):format(album and #album.tracks or 0));
         imgui.BeginChild('vanatunes_songs', { 0, 200 }, ImGuiChildFlags_Borders);
-        for i, t in ipairs(player.tracks) do
+        for _, i in ipairs(album and album.tracks or {}) do
+            local t = player.tracks[i];
             if imgui.Checkbox('##on' .. i, t.on) then player.bag = T{}; save_skipped(); end
             imgui.SameLine();
             if vd.Selectable(t.name .. (t.bad and '  (will not play)' or '') .. '##song' .. i, i == player.current and player.state ~= 'stopped') then
