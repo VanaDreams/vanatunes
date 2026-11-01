@@ -22,7 +22,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.8';
+addon.version = '0.3.9';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -277,7 +277,7 @@ local function scan()
     local albums = T{};
     local function add_album(id, label, path)
         if not ashita.fs.exists(path) then return; end
-        local album = { id = id, name = label, tracks = T{} };
+        local album = { id = id, name = label, path = path, tracks = T{} };
         for _, name in ipairs(ashita.fs.get_dir(path, '.*', false) or {}) do
                 local ext = name:match('%.([^%.\\/]+)$');
                 if ext and EXTENSIONS[ext:lower()] then
@@ -298,9 +298,25 @@ local function scan()
     for _, name in ipairs(subfolders(dir)) do
         add_album('mine/' .. name:lower(), name .. ' (Mine)', dir .. name .. '\\');
     end
-    -- Sorting the tracks within each album leaves album order predictable.
+    -- An album may name its intended play order, one exact filename per line.
+    -- Other albums keep the existing alphabetical order.
     for _, album in ipairs(albums) do
-        table.sort(album.tracks, function (a, b) return found[a].name:lower() < found[b].name:lower(); end);
+        local rank = {};
+        local order_file = album.path .. 'playlist-order.txt';
+        local file = io.open(order_file, 'r');
+        if file then
+            local n = 0;
+            for line in file:lines() do
+                local name = line:gsub('\r$', '');
+                if name ~= '' then n = n + 1; rank[name:lower()] = n; end
+            end
+            file:close();
+        end
+        table.sort(album.tracks, function (a, b)
+            local ra, rb = rank[found[a].name:lower()] or math.huge, rank[found[b].name:lower()] or math.huge;
+            if ra ~= rb then return ra < rb; end
+            return found[a].name:lower() < found[b].name:lower();
+        end);
     end
     player.albums = albums;
     local selected = nil;
