@@ -22,7 +22,7 @@
 
 addon.name    = 'vanatunes';
 addon.author  = 'Vanadreams';
-addon.version = '0.3.9';
+addon.version = '0.3.10';
 addon.desc    = 'Your own playlist, shuffled, wherever you are.';
 addon.link    = 'https://github.com/VanaDreams/vanatunes';
 
@@ -584,7 +584,10 @@ ashita.events.register('packet_in', 'vanatunes_mount', function (e)
     if cfg.mount_drop[1] then
         e.blocked = true;
     else
-        ffi.cast('uint16_t*', e.data_modified_raw + 0x06)[0] = 0;
+        -- Ashita exposes the raw buffer as userdata: cast before accessing its bytes.
+        local packet = ffi.cast('uint8_t*', e.data_modified_raw);
+        packet[0x06] = 0;
+        packet[0x07] = 0;
     end
 end);
 
